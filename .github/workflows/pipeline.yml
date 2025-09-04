@@ -23,7 +23,7 @@ jobs:
   test:
     name: Backend Tests
     runs-on: ubuntu-latest
-  timeout-minutes: 10
+    timeout-minutes: 10
     defaults:
       run:
         working-directory: ${{ env.BACKEND_DIR }}
