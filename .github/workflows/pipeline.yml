@@ -1,0 +1,199 @@
+name: CI/CD - Backend on PR to pipeline-GG
+name: CI/CD - Backend on PR to pipeline-GG
+
+on:
+  pull_request:
+    branches: [pipeline-GG]
+    types: [opened, synchronize, reopened]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  BACKEND_DIR: backend
+  S3_BUCKET: ${{ secrets.S3_BUCKET }}
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  EC2_INSTANCE_ID: ${{ secrets.EC2_INSTANCE_ID }}
+
+jobs:
+  test:
+    name: Backend Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: ${{ env.BACKEND_DIR }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: |
+            backend/package-lock.json
+            backend/package.json
+
+      - name: Install dependencies
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci
+          else
+            npm install
+          fi
+
+      - name: Generate Prisma client
+        run: npm run prisma:generate
+
+      - name: Run tests with coverage
+        run: npm test -- --ci --runInBand --coverage
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: backend/coverage/
+          retention-days: 7
+
+  build:
+    name: Backend Build
+    runs-on: ubuntu-latest
+    needs: test
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: |
+            backend/package-lock.json
+            backend/package.json
+
+      - name: Install dependencies
+        working-directory: ${{ env.BACKEND_DIR }}
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci
+          else
+            npm install
+          fi
+
+      - name: Build
+        working-directory: ${{ env.BACKEND_DIR }}
+        run: npm run build
+
+      - name: Generate Prisma client
+        working-directory: ${{ env.BACKEND_DIR }}
+        run: npm run prisma:generate
+
+      - name: Validate build output
+        working-directory: ${{ env.BACKEND_DIR }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ ! -d "dist" ]; then
+            echo "dist directory missing" >&2
+            exit 1
+          fi
+          if [ ! -f "dist/index.js" ]; then
+            echo "dist/index.js missing" >&2
+            exit 1
+          fi
+
+      - name: Package artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "${BACKEND_DIR}"
+          FILES="dist package.json prisma"
+          if [ -f package-lock.json ]; then FILES="$FILES package-lock.json"; fi
+          tar -czf ../artifact.tar.gz $FILES
+          ls -lh ../artifact.tar.gz
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-artifact
+          path: artifact.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  deploy:
+    name: Deploy to EC2 (SSM)
+    runs-on: ubuntu-latest
+    needs: build
+    if: ${{ secrets.AWS_ACCESS_KEY_ID != '' && secrets.AWS_SECRET_ACCESS_KEY != '' && secrets.AWS_REGION != '' && secrets.S3_BUCKET != '' && secrets.EC2_INSTANCE_ID != '' }}
+    timeout-minutes: 15
+    environment:
+      name: production
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: backend-artifact
+          path: .
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Upload artifact to S3
+        shell: bash
+        run: |
+          set -euo pipefail
+          KEY="artifacts/backend/${{ github.run_id }}-${{ github.sha }}.tar.gz"
+          echo "S3 uri: s3://${S3_BUCKET}/${KEY}"
+          aws s3 cp artifact.tar.gz "s3://${S3_BUCKET}/${KEY}"
+          echo "S3_KEY=${KEY}" >> $GITHUB_ENV
+
+      - name: Deploy via SSM Send-Command
+        shell: bash
+        run: |
+          set -euo pipefail
+          CMD_ID=$(aws ssm send-command \
+            --document-name "AWS-RunShellScript" \
+            --comment "Deploy backend from GitHub Actions run ${{ github.run_id }}" \
+            --instance-ids "${EC2_INSTANCE_ID}" \
+            --parameters "commands=[\"bash -lc 'set -euo pipefail; APP_DIR=/opt/app/backend; sudo mkdir -p $APP_DIR; sudo chown -R ec2-user:ec2-user $APP_DIR || true; cd $APP_DIR; echo Downloading artifact from s3://${S3_BUCKET}/${S3_KEY}; aws s3 cp s3://${S3_BUCKET}/${S3_KEY} ./artifact.tar.gz; tar -xzf artifact.tar.gz; rm -f artifact.tar.gz; if [ -f package-lock.json ]; then npm ci; else npm install; fi; npx prisma generate || true; if command -v systemctl >/dev/null 2>&1; then sudo systemctl restart backend.service || true; fi; if command -v pm2 >/dev/null 2>&1; then if pm2 list | grep -q backend; then pm2 reload backend --update-env; else pm2 start dist/index.js --name backend --update-env; fi; fi; if ! (systemctl is-active --quiet backend.service 2>/dev/null || pm2 list | grep -q backend); then nohup node dist/index.js >/var/log/backend.log 2>&1 & fi; echo Deployment completed'\"]" \
+            --timeout-seconds 600 \
+            --region "${AWS_REGION}" \
+            --query "Command.CommandId" --output text)
+
+          echo "SSM CommandId: $CMD_ID"
+          aws ssm wait command-executed --command-id "$CMD_ID" --instance-id "${EC2_INSTANCE_ID}" --region "${AWS_REGION}"
+
+      - name: Health check via SSM (port 3010)
+        shell: bash
+        run: |
+          set -euo pipefail
+          HC_CMD=$(cat <<'EOS'
+          bash -lc 'set -euo pipefail; PORT=3010; for i in 1 2 3 4 5; do if command -v curl >/dev/null 2>&1; then true; else if command -v apt-get >/dev/null 2>&1; then sudo apt-get update -y && sudo apt-get install -y curl; elif command -v yum >/dev/null 2>&1; then sudo yum install -y curl; fi; fi; if curl -fsS "http://localhost:${PORT}/" >/dev/null || curl -fsS "http://127.0.0.1:${PORT}/" >/dev/null; then echo "Health check OK"; exit 0; fi; echo "Waiting for app on port ${PORT}..."; sleep 5; done; echo "Health check failed" >&2; exit 1;'
+          EOS
+          )
+          CMD_ID=$(aws ssm send-command \
+            --document-name "AWS-RunShellScript" \
+            --instance-ids "${EC2_INSTANCE_ID}" \
+            --parameters commands=["$HC_CMD"] \
+            --timeout-seconds 180 \
+            --region "${AWS_REGION}" \
+            --query "Command.CommandId" --output text)
+          echo "SSM Health CommandId: $CMD_ID"
+          aws ssm wait command-executed --command-id "$CMD_ID" --instance-id "${EC2_INSTANCE_ID}" --region "${AWS_REGION}"
+
+    # Prerequisites (docs):
+    # - S3 bucket exists and Secrets set: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION, S3_BUCKET, EC2_INSTANCE_ID
+    # - EC2 instance: SSM Agent installed, IAM Role with SSM + S3 read, Node.js >= 18 installed, optional systemd/pm2
